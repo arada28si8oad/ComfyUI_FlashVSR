@@ -1,3 +1,4 @@
+from safetensors.torch import load_file as load_safetensors
 import torch, os
 from safetensors import safe_open
 from contextlib import contextmanager
@@ -80,11 +81,21 @@ def load_state_dict_from_safetensors(file_path, torch_dtype=None):
 
 
 def load_state_dict_from_bin(file_path, torch_dtype=None):
-    state_dict = torch.load(file_path, map_location="cpu", weights_only=False)
+    """
+    Load a state dict from a .bin or .safetensors file.
+    This is the modified function.
+    """
+    if file_path.endswith(".safetensors"):
+        # Use the correct loader for .safetensors files
+        state_dict = load_safetensors(file_path, device="cpu")
+    else:
+        # Use the original torch.load for other file types (.bin, .pt, etc.)
+        state_dict = torch.load(file_path, map_location="cpu", weights_only=False)
+
     if torch_dtype is not None:
-        for i in state_dict:
-            if isinstance(state_dict[i], torch.Tensor):
-                state_dict[i] = state_dict[i].to(torch_dtype)
+        for k, v in state_dict.items():
+            if v.dtype == torch.float32:
+                state_dict[k] = v.to(torch_dtype)
     return state_dict
 
 
