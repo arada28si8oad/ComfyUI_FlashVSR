@@ -1,65 +1,40 @@
+import torch
+from os.path import isfile
 from safetensors.torch import load_file as load_safetensors
-import torch, os
-from safetensors import safe_open
-from contextlib import contextmanager
-import hashlib
+from huggingface_hub import hf_hub_download
 
-@contextmanager
-def init_weights_on_device(device = torch.device("meta"), include_buffers :bool = False):
-    
-    old_register_parameter = torch.nn.Module.register_parameter
-    if include_buffers:
-        old_register_buffer = torch.nn.Module.register_buffer
-    
-    def register_empty_parameter(module, name, param):
-        old_register_parameter(module, name, param)
-        if param is not None:
-            param_cls = type(module._parameters[name])
-            kwargs = module._parameters[name].__dict__
-            kwargs["requires_grad"] = param.requires_grad
-            module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
 
-    def register_empty_buffer(module, name, buffer, persistent=True):
-        old_register_buffer(module, name, buffer, persistent=persistent)
-        if buffer is not None:
-            module._buffers[name] = module._buffers[name].to(device)
-            
-    def patch_tensor_constructor(fn):
-        def wrapper(*args, **kwargs):
-            kwargs["device"] = device
-            return fn(*args, **kwargs)
+def get_model_path(model_id, cache_dir=None, file_name=None):
+    if isfile(model_id):
+        return model_id
+    if file_name is None:
+        file_name = "diffusion_pytorch_model.bin"
+    return hf_hub_download(repo_id=model_id, filename=file_name, cache_dir=cache_dir)
 
-        return wrapper
-    
-    if include_buffers:
-        tensor_constructors_to_patch = {
-            torch_function_name: getattr(torch, torch_function_name)
-            for torch_function_name in ["empty", "zeros", "ones", "full"]
-        }
+
+def is_safetensors(path):
+    return path.endswith(".safetensors")
+
+
+def get_state_dict_from_checkpoint(checkpoint):
+    state_dict = checkpoint
+    if "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    return state_dict
+
+
+def get_state_dict(model_id_or_path, cache_dir=None, file_name=None, torch_dtype=None):
+    if isfile(model_id_or_path):
+        if is_safetensors(model_id_or_path):
+            state_dict = load_state_dict_from_safetensors(model_id_or_path, torch_dtype=torch_dtype)
+        else:
+            state_dict = load_state_dict_from_bin(model_id_or_path, torch_dtype=torch_dtype)
     else:
-        tensor_constructors_to_patch = {}
-    
-    try:
-        torch.nn.Module.register_parameter = register_empty_parameter
-        if include_buffers:
-            torch.nn.Module.register_buffer = register_empty_buffer
-        for torch_function_name in tensor_constructors_to_patch.keys():
-            setattr(torch, torch_function_name, patch_tensor_constructor(getattr(torch, torch_function_name)))
-        yield
-    finally:
-        torch.nn.Module.register_parameter = old_register_parameter
-        if include_buffers:
-            torch.nn.Module.register_buffer = old_register_buffer
-        for torch_function_name, old_torch_function in tensor_constructors_to_patch.items():
-            setattr(torch, torch_function_name, old_torch_function)
-
-def load_state_dict_from_folder(file_path, torch_dtype=None):
-    state_dict = {}
-    for file_name in os.listdir(file_path):
-        if "." in file_name and file_name.split(".")[-1] in [
-            "safetensors", "bin", "ckpt", "pth", "pt"
-        ]:
-            state_dict.update(load_state_dict(os.path.join(file_path, file_name), torch_dtype=torch_dtype))
+        model_path = get_model_path(model_id_or_path, cache_dir, file_name)
+        if is_safetensors(model_path):
+            state_dict = load_state_dict_from_safetensors(model_path, torch_dtype=torch_dtype)
+        else:
+            state_dict = load_state_dict_from_bin(model_path, torch_dtype=torch_dtype)
     return state_dict
 
 
@@ -71,12 +46,11 @@ def load_state_dict(file_path, torch_dtype=None):
 
 
 def load_state_dict_from_safetensors(file_path, torch_dtype=None):
-    state_dict = {}
-    with safe_open(file_path, framework="pt", device="cpu") as f:
-        for k in f.keys():
-            state_dict[k] = f.get_tensor(k)
-            if torch_dtype is not None:
-                state_dict[k] = state_dict[k].to(torch_dtype)
+    state_dict = load_safetensors(file_path)
+    if torch_dtype is not None:
+        for k, v in state_dict.items():
+            if v.dtype == torch.float32:
+                state_dict[k] = v.to(torch_dtype)
     return state_dict
 
 
@@ -85,8 +59,8 @@ def load_state_dict_from_bin(file_path, torch_dtype=None):
     Load a state dict from a .bin or .safetensors file.
     This is the modified function.
     """
+    # This logic correctly handles both file types.
     if file_path.endswith(".safetensors"):
-        # Use the correct loader for .safetensors files
         state_dict = load_safetensors(file_path, device="cpu")
     else:
         # Use the original torch.load for other file types (.bin, .pt, etc.)
@@ -99,95 +73,37 @@ def load_state_dict_from_bin(file_path, torch_dtype=None):
     return state_dict
 
 
-def search_for_embeddings(state_dict):
-    embeddings = []
-    for k in state_dict:
-        if isinstance(state_dict[k], torch.Tensor):
-            embeddings.append(state_dict[k])
-        elif isinstance(state_dict[k], dict):
-            embeddings += search_for_embeddings(state_dict[k])
-    return embeddings
+def set_module_from_state_dict(module, state_dict, prefix=""):
+    if not prefix.endswith(".") and len(prefix) > 0:
+        prefix += "."
+    
+    # Load module parameters
+    module_keys = [k[len(prefix):] for k in state_dict.keys() if k.startswith(prefix)]
+    missing_keys = []
+    for k, v in module.named_parameters():
+        if k not in module_keys:
+            missing_keys.append(k)
+    if len(missing_keys) > 0:
+        print(f"Warning: The following parameters are not loaded: {missing_keys}")
+    
+    # Update module
+    module.load_state_dict({k: state_dict[prefix+k] for k in module_keys}, strict=False)
 
 
-def search_parameter(param, state_dict):
-    for name, param_ in state_dict.items():
-        if param.numel() == param_.numel():
-            if param.shape == param_.shape:
-                if torch.dist(param, param_) < 1e-3:
-                    return name
-            else:
-                if torch.dist(param.flatten(), param_.flatten()) < 1e-3:
-                    return name
-    return None
-
-
-def build_rename_dict(source_state_dict, target_state_dict, split_qkv=False):
-    matched_keys = set()
-    with torch.no_grad():
-        for name in source_state_dict:
-            rename = search_parameter(source_state_dict[name], target_state_dict)
-            if rename is not None:
-                print(f'"{name}": "{rename}",')
-                matched_keys.add(rename)
-            elif split_qkv and len(source_state_dict[name].shape)>=1 and source_state_dict[name].shape[0]%3==0:
-                length = source_state_dict[name].shape[0] // 3
-                rename = []
-                for i in range(3):
-                    rename.append(search_parameter(source_state_dict[name][i*length: i*length+length], target_state_dict))
-                if None not in rename:
-                    print(f'"{name}": {rename},')
-                    for rename_ in rename:
-                        matched_keys.add(rename_)
-    for name in target_state_dict:
-        if name not in matched_keys:
-            print("Cannot find", name, target_state_dict[name].shape)
-
-
-def search_for_files(folder, extensions):
-    files = []
-    if os.path.isdir(folder):
-        for file in sorted(os.listdir(folder)):
-            files += search_for_files(os.path.join(folder, file), extensions)
-    elif os.path.isfile(folder):
-        for extension in extensions:
-            if folder.endswith(extension):
-                files.append(folder)
-                break
-    return files
-
-
-def convert_state_dict_keys_to_single_str(state_dict, with_shape=True):
-    keys = []
-    for key, value in state_dict.items():
-        if isinstance(key, str):
-            if isinstance(value, torch.Tensor):
-                if with_shape:
-                    shape = "_".join(map(str, list(value.shape)))
-                    keys.append(key + ":" + shape)
-                keys.append(key)
-            elif isinstance(value, dict):
-                keys.append(key + "|" + convert_state_dict_keys_to_single_str(value, with_shape=with_shape))
-    keys.sort()
-    keys_str = ",".join(keys)
-    return keys_str
-
-
-def split_state_dict_with_prefix(state_dict):
-    keys = sorted([key for key in state_dict if isinstance(key, str)])
-    prefix_dict = {}
-    for key in  keys:
-        prefix = key if "." not in key else key.split(".")[0]
-        if prefix not in prefix_dict:
-            prefix_dict[prefix] = []
-        prefix_dict[prefix].append(key)
-    state_dicts = []
-    for prefix, keys in prefix_dict.items():
-        sub_state_dict = {key: state_dict[key] for key in keys}
-        state_dicts.append(sub_state_dict)
-    return state_dicts
-
-
-def hash_state_dict_keys(state_dict, with_shape=True):
-    keys_str = convert_state_dict_keys_to_single_str(state_dict, with_shape=with_shape)
-    keys_str = keys_str.encode(encoding="UTF-8")
-    return hashlib.md5(keys_str).hexdigest()
+def set_module_from_state_dict_by_name(module, state_dict, name):
+    prefix = name
+    if name is not None and len(name) > 0:
+        prefix += "."
+    
+    # Load module parameters
+    state_dict_keys = [k for k in state_dict.keys() if (name is None) or k.startswith(prefix)]
+    module_keys = {k for k, v in module.named_parameters()}
+    
+    # Check missing keys
+    missing_keys = [k for k in module_keys if (prefix + k) not in state_dict_keys]
+    if len(missing_keys) > 0:
+        print(f"Warning: The following parameters are not loaded: {missing_keys}")
+    
+    # Update module
+    sub_state_dict = {k[len(prefix):]: v for k, v in state_dict.items() if k in state_dict_keys}
+    module.load_state_dict(sub_state_dict, strict=False)
